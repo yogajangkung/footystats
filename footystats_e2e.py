@@ -5,6 +5,8 @@ import json
 import joblib
 import pandas as pd
 import numpy as np
+import time
+import requests
 from datetime import timedelta
 
 # ======================
@@ -32,112 +34,162 @@ CALIB = joblib.load(f"{ART_PREFIX}_calib_model.joblib")
 with open(f"{ART_PREFIX}_config.json") as f:
     CFG = json.load(f)
 
-# ======================
-# STEP 1 — DOWNLOAD GSHEETS (APPEND)
-# ======================
-print("📥 Downloading Google Sheets...")
+def send_telegram(df):
+    TOKEN = os.environ.get("TG_TOKEN")
+    CHAT_ID = os.environ.get("TG_CHAT_ID")
 
-url = (
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
-    f"?tqx=out:csv&sheet={SHEET_NAME}&range=A1:O1000"
-)
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ Telegram token / chat_id not set")
+        return
 
-df = pd.read_csv(url)
-df["snapshot_time"] = pd.Timestamp.utcnow()
+    if df.empty:
+        return
 
-if os.path.exists(HISTORY_CSV):
-    df.to_csv(HISTORY_CSV, mode="a", header=False, index=False)
-else:
-    df.to_csv(HISTORY_CSV, index=False)
+    lines = []
+    lines.append("🔥 *FOOTYSTATS BET SIGNAL* 🔥\n")
 
-print(f"✔ Snapshot appended: {len(df)} rows")
+    for _, r in df.iterrows():
+        line = (
+            f"🏟️ *{r.HomeTeam} vs {r.AwayTeam}*\n"
+            f"Form: {r.HomeForm:.2f} vs {r.AwayForm:.2f}\n"
+            f"Prob Home: {r.Prob_Home:.2%}\n"
+            f"Odds: {r.HomeOdds:.2f} | {r.DrawOdds:.2f} | {r.AwayOdds:.2f}\n"
+            f"EV Home: {r.EV_Home:.2%}\n"
+            f"Stability: {r.SnapshotCount} snaps | σ={r.OddsStd:.3f}\n"
+            "────────────"
+        )
+        lines.append(line)
 
-# ======================
-# STEP 2 — SNAPSHOT FILTER (ODDS STABLE)
-# ======================
-print("🧮 Building stable odds snapshot...")
+    message = "\n".join(lines)
 
-hist = pd.read_csv(HISTORY_CSV, parse_dates=["snapshot_time"])
-cutoff = hist["snapshot_time"].max() - timedelta(hours=HOURS_BACK)
-hist = hist[hist["snapshot_time"] >= cutoff]
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
 
-rows = []
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        print("📨 Telegram sent:", r.json().get("ok"))
+    except Exception as e:
+        print("❌ Telegram error:", e)
 
-for (home, away), g in hist.groupby(["HomeTeam", "AwayTeam"]):
-    if len(g) < MIN_SNAPSHOTS:
-        continue
 
-    odds_std = g["HomeOdds"].std()
+while True:
+    # ======================
+    # STEP 1 — DOWNLOAD GSHEETS (APPEND)
+    # ======================
+    print("📥 Downloading Google Sheets...")
 
-    if odds_std > MAX_ODDS_STD:
-        continue
-
-    rows.append({
-        "HomeTeam": home,
-        "AwayTeam": away,
-        "HomeForm": g["HomeForm"].iloc[-1],
-        "AwayForm": g["AwayForm"].iloc[-1],
-        "HomeOdds": g["HomeOdds"].median(),
-        "DrawOdds": g["DrawOdds"].median(),
-        "AwayOdds": g["AwayOdds"].median(),
-        "SnapshotCount": len(g),
-        "OddsStd": odds_std
-    })
-
-snap = pd.DataFrame(rows)
-if snap.empty:
-    print("⚠️ No stable matches yet — need more snapshots.")
-    snap.to_csv(SNAPSHOT_CSV, index=False)
-    exit(0)
-snap.to_csv(SNAPSHOT_CSV, index=False)
-
-print(f"✔ Stable matches: {len(snap)}")
-
-# ======================
-# STEP 3 — PREDICTION
-# ======================
-print("🤖 Running prediction model...")
-
-def decide(row):
-    h, a = row.HomeForm, row.AwayForm
-    ho, do, ao = row.HomeOdds, row.DrawOdds, row.AwayOdds
-
-    formdiff = h - a
-
-    imp = np.array([1/ho, 1/do, 1/ao])
-    imp /= imp.sum()
-
-    X = np.array([[formdiff, imp[0], imp[1], imp[2], 1]])
-    X = IMP.transform(X)
-
-    probs = CALIB.predict_proba(X)[0]
-    classes = CALIB.classes_
-
-    p = dict(zip(classes, probs))
-    p_home = p["HomeWin"]
-
-    ev_home = p_home * ho - 1
-
-    decision = (
-        p_home >= 0.90 and
-        ev_home >= CFG["EV_THRESH"]
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet={SHEET_NAME}&range=A1:O1000"
     )
 
-    return pd.Series({
-        "Prob_Home": p_home,
-        "EV_Home": ev_home,
-        "Decision": "BET" if decision else "NO_BET"
-    })
+    df = pd.read_csv(url)
+    df["snapshot_time"] = pd.Timestamp.utcnow()
 
-pred = snap.join(snap.apply(decide, axis=1))
-pred["OddsSource"] = f"MEDIAN_{HOURS_BACK}H"
+    if os.path.exists(HISTORY_CSV):
+        df.to_csv(HISTORY_CSV, mode="a", header=False, index=False)
+    else:
+        df.to_csv(HISTORY_CSV, index=False)
 
-pred.to_csv(OUTPUT_CSV, index=False)
+    print(f"✔ Snapshot appended: {len(df)} rows")
 
-print("✅ DONE")
-print(pred[[
-    "HomeTeam", "AwayTeam",
-    "Prob_Home", "EV_Home",
-    "SnapshotCount", "OddsStd",
-    "Decision"
-]].sort_values("Prob_Home", ascending=False).head(10))
+    # ======================
+    # STEP 2 — SNAPSHOT FILTER (ODDS STABLE)
+    # ======================
+    print("🧮 Building stable odds snapshot...")
+
+    hist = pd.read_csv(HISTORY_CSV, parse_dates=["snapshot_time"])
+    cutoff = hist["snapshot_time"].max() - timedelta(hours=HOURS_BACK)
+    hist = hist[hist["snapshot_time"] >= cutoff]
+
+    rows = []
+
+    for (home, away), g in hist.groupby(["HomeTeam", "AwayTeam"]):
+        if len(g) < MIN_SNAPSHOTS:
+            continue
+
+        odds_std = g["HomeOdds"].std()
+
+        if odds_std > MAX_ODDS_STD:
+            continue
+
+        rows.append({
+            "HomeTeam": home,
+            "AwayTeam": away,
+            "HomeForm": g["HomeForm"].iloc[-1],
+            "AwayForm": g["AwayForm"].iloc[-1],
+            "HomeOdds": g["HomeOdds"].median(),
+            "DrawOdds": g["DrawOdds"].median(),
+            "AwayOdds": g["AwayOdds"].median(),
+            "SnapshotCount": len(g),
+            "OddsStd": odds_std
+        })
+
+    snap = pd.DataFrame(rows)
+    if snap.empty:
+        print("⚠️ No stable matches yet — need more snapshots.")
+        snap.to_csv(SNAPSHOT_CSV, index=False)
+        print("Waiting 1 hour...")
+        time.sleep(3600)
+    snap.to_csv(SNAPSHOT_CSV, index=False)
+
+    print(f"✔ Stable matches: {len(snap)}")
+
+    # ======================
+    # STEP 3 — PREDICTION
+    # ======================
+    print("🤖 Running prediction model...")
+
+    def decide(row):
+        h, a = row.HomeForm, row.AwayForm
+        ho, do, ao = row.HomeOdds, row.DrawOdds, row.AwayOdds
+
+        formdiff = h - a
+
+        imp = np.array([1/ho, 1/do, 1/ao])
+        imp /= imp.sum()
+
+        X = np.array([[formdiff, imp[0], imp[1], imp[2], 1]])
+        X = IMP.transform(X)
+
+        probs = CALIB.predict_proba(X)[0]
+        classes = CALIB.classes_
+
+        p = dict(zip(classes, probs))
+        p_home = p["HomeWin"]
+
+        ev_home = p_home * ho - 1
+
+        decision = (
+            p_home >= 0.90 and
+            ev_home >= CFG["EV_THRESH"]
+        )
+
+        return pd.Series({
+            "Prob_Home": p_home,
+            "EV_Home": ev_home,
+            "Decision": "BET" if decision else "NO_BET"
+        })
+
+    pred = snap.join(snap.apply(decide, axis=1))
+    pred["OddsSource"] = f"MEDIAN_{HOURS_BACK}H"
+
+    pred.to_csv(OUTPUT_CSV, index=False)
+    bets = pred[pred["Decision"] == "BET"]
+
+    print("✅ DONE")
+    print(pred[[
+        "HomeTeam", "AwayTeam",
+        "Prob_Home", "EV_Home",
+        "SnapshotCount", "OddsStd",
+        "Decision"
+    ]].sort_values("Prob_Home", ascending=False).head(10))
+
+    if not bets.empty:
+        send_telegram(bets)
+    else:
+        print("ℹ️ No BET signals to send")
