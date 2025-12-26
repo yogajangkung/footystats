@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import requests
+import time
 from datetime import datetime
 
 # ==============================
@@ -101,49 +102,50 @@ def send_telegram(df):
     else:
         print("❌ Telegram error:", r.text)
 
+while True:
+    # ==============================
+    # MAIN PIPELINE
+    # ==============================
+    dfs = []
 
-# ==============================
-# MAIN PIPELINE
-# ==============================
-dfs = []
+    for sheet in sheet_names:
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
+            f"?tqx=out:csv"
+            f"&sheet={sheet}"
+            f"&range=A1:O1000"
+        )
 
-for sheet in sheet_names:
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
-        f"?tqx=out:csv"
-        f"&sheet={sheet}"
-        f"&range=A1:O1000"
-    )
+        df = pd.read_csv(url, header=None)
 
-    df = pd.read_csv(url, header=None)
+        # Ambil kolom A,B,I,J,K,M,O (by index)
+        df = df.iloc[:, [0, 1, 8, 9, 10, 12, 14]]
 
-    # Ambil kolom A,B,I,J,K,M,O (by index)
-    df = df.iloc[:, [0, 1, 8, 9, 10, 12, 14]]
+        # Rename kolom agar konsisten
+        df.columns = [
+            "HomeTeam",   # A
+            "AwayTeam",   # B
+            "Prob_Home",  # I
+            "Prob_Away",  # J
+            "HomeOdds",   # K
+            "DrawOdds",   # M
+            "AwayOdds"    # O
+        ]
 
-    # Rename kolom agar konsisten
-    df.columns = [
-        "HomeTeam",   # A
-        "AwayTeam",   # B
-        "Prob_Home",  # I
-        "Prob_Away",  # J
-        "HomeOdds",   # K
-        "DrawOdds",   # M
-        "AwayOdds"    # O
-    ]
+        df["EV_Home"] = (df["Prob_Home"] * df["HomeOdds"]) - 1
+        df["source"] = sheet
+        df["fetched_at"] = datetime.utcnow()
 
-    df["EV_Home"] = (df["Prob_Home"] * df["HomeOdds"]) - 1
-    df["source"] = sheet
-    df["fetched_at"] = datetime.utcnow()
+        dfs.append(df)
+        print(sheet, len(df))
 
-    dfs.append(df)
-    print(sheet, len(df))
+    # GABUNG KE BAWAH
+    final_df = pd.concat(dfs, ignore_index=True)
 
-# GABUNG KE BAWAH
-final_df = pd.concat(dfs, ignore_index=True)
+    # SIMPAN CSV
+    final_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"✅ CSV saved: {OUTPUT_CSV} ({len(final_df)} rows)")
 
-# SIMPAN CSV
-final_df.to_csv(OUTPUT_CSV, index=False)
-print(f"✅ CSV saved: {OUTPUT_CSV} ({len(final_df)} rows)")
-
-# KIRIM TELEGRAM (ANTI DUPLIKASI)
-send_telegram(final_df)
+    # KIRIM TELEGRAM (ANTI DUPLIKASI)
+    send_telegram(final_df)
+    time.sleep(900)
