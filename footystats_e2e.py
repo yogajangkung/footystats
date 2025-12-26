@@ -1,61 +1,85 @@
-#!/usr/bin/env python3
-
-import os
-import json
-import joblib
 import pandas as pd
-import numpy as np
-import time
+import os
 import requests
-from datetime import timedelta
+from datetime import datetime
 
-# ======================
+# ==============================
 # CONFIG
-# ======================
-SHEET_ID = "15tEvxrNqecs6zzYh8Gc_WcgWGXI_9LHVtNZeUWR_skE"
-SHEET_NAME = "Footystats_Data"
-HISTORY_CSV = "footystats_history.csv"
-SNAPSHOT_CSV = "footystats_snapshot.csv"
-OUTPUT_CSV = "footystats_predictions.csv"
+# ==============================
+sheet_id = "15tEvxrNqecs6zzYh8Gc_WcgWGXI_9LHVtNZeUWR_skE"
+sheet_names = ["Footystats_Data_Home", "Footystats_Data_Away"]
 
-# HOURS_BACK = 6
-# MIN_SNAPSHOTS = 3
-# MAX_ODDS_STD = 0.05
+OUTPUT_CSV = "footystats_combined.csv"
+SENT_FILE = "sent_telegram.csv"
 
-HOURS_BACK = 12
-MIN_SNAPSHOTS = 2
-MAX_ODDS_STD = 0.10
+TOKEN = "5639278356:AAFJf7TkrQna2yumFuEuUjFj1dvwgtLBq6g"
+CHAT_ID = "434215579"
 
-# model artifacts
-ART_PREFIX = "pipeline_artifact"
-IMP = joblib.load(f"{ART_PREFIX}_imputer.joblib")
-CALIB = joblib.load(f"{ART_PREFIX}_calib_model.joblib")
 
-with open(f"{ART_PREFIX}_config.json") as f:
-    CFG = json.load(f)
+# ==============================
+# SENT FIXTURE STORAGE
+# ==============================
+def load_sent_ids():
+    if not os.path.exists(SENT_FILE):
+        return set()
+    df = pd.read_csv(SENT_FILE)
+    return set(df["fixture_id"].astype(str))
 
+
+def save_sent_ids(ids):
+    if not ids:
+        return
+
+    df_new = pd.DataFrame({"fixture_id": list(ids)})
+
+    if os.path.exists(SENT_FILE):
+        df_old = pd.read_csv(SENT_FILE)
+        df_all = pd.concat([df_old, df_new]).drop_duplicates()
+    else:
+        df_all = df_new
+
+    df_all.to_csv(SENT_FILE, index=False)
+
+
+# ==============================
+# FIXTURE ID
+# ==============================
+def build_fixture_id(df):
+    return (
+        df["HomeTeam"].str.lower().str.strip()
+        + "_vs_"
+        + df["AwayTeam"].str.lower().str.strip()
+    )
+
+
+# ==============================
+# TELEGRAM
+# ==============================
 def send_telegram(df):
-    TOKEN = os.environ.get("TG_TOKEN")
-    CHAT_ID = os.environ.get("TG_CHAT_ID")
-
-    if not TOKEN or not CHAT_ID:
-        print("⚠️ Telegram token / chat_id not set")
-        return
-
     if df.empty:
+        print("ℹ️ No data to send")
         return
 
-    lines = []
-    lines.append("🔥 *FOOTYSTATS BET SIGNAL* 🔥\n")
+    sent_ids = load_sent_ids()
 
-    for _, r in df.iterrows():
+    df = df.copy()
+    df["fixture_id"] = build_fixture_id(df)
+
+    # FILTER YANG BELUM PERNAH DIKIRIM
+    df_new = df[~df["fixture_id"].isin(sent_ids)]
+
+    if df_new.empty:
+        print("ℹ️ No new fixtures")
+        return
+
+    lines = ["🔥 *FOOTYSTATS BET SIGNAL* 🔥\n"]
+
+    for _, r in df_new.iterrows():
         line = (
             f"🏟️ *{r.HomeTeam} vs {r.AwayTeam}*\n"
-            f"Form: {r.HomeForm:.2f} vs {r.AwayForm:.2f}\n"
             f"Prob Home: {r.Prob_Home:.2%}\n"
             f"Odds: {r.HomeOdds:.2f} | {r.DrawOdds:.2f} | {r.AwayOdds:.2f}\n"
             f"EV Home: {r.EV_Home:.2%}\n"
-            f"Stability: {r.SnapshotCount} snaps | σ={r.OddsStd:.3f}\n"
             "────────────"
         )
         lines.append(line)
@@ -69,127 +93,57 @@ def send_telegram(df):
         "parse_mode": "Markdown"
     }
 
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        print("📨 Telegram sent:", r.json().get("ok"))
-    except Exception as e:
-        print("❌ Telegram error:", e)
+    r = requests.post(url, data=payload, timeout=10)
+
+    if r.ok and r.json().get("ok"):
+        print(f"📨 Sent {len(df_new)} fixtures")
+        save_sent_ids(set(df_new["fixture_id"]))
+    else:
+        print("❌ Telegram error:", r.text)
 
 
-while True:
-    # ======================
-    # STEP 1 — DOWNLOAD GSHEETS (APPEND)
-    # ======================
-    print("📥 Downloading Google Sheets...")
+# ==============================
+# MAIN PIPELINE
+# ==============================
+dfs = []
 
+for sheet in sheet_names:
     url = (
-        f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
-        f"?tqx=out:csv&sheet={SHEET_NAME}&range=A1:O1000"
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
+        f"?tqx=out:csv"
+        f"&sheet={sheet}"
+        f"&range=A1:O1000"
     )
 
-    df = pd.read_csv(url)
-    df["snapshot_time"] = pd.Timestamp.utcnow()
+    df = pd.read_csv(url, header=None)
 
-    if os.path.exists(HISTORY_CSV):
-        df.to_csv(HISTORY_CSV, mode="a", header=False, index=False)
-    else:
-        df.to_csv(HISTORY_CSV, index=False)
+    # Ambil kolom A,B,I,J,K,M,O (by index)
+    df = df.iloc[:, [0, 1, 8, 9, 10, 12, 14]]
 
-    print(f"✔ Snapshot appended: {len(df)} rows")
+    # Rename kolom agar konsisten
+    df.columns = [
+        "HomeTeam",   # A
+        "AwayTeam",   # B
+        "Prob_Home",  # I
+        "Prob_Away",  # J
+        "HomeOdds",   # K
+        "DrawOdds",   # M
+        "AwayOdds"    # O
+    ]
 
-    # ======================
-    # STEP 2 — SNAPSHOT FILTER (ODDS STABLE)
-    # ======================
-    print("🧮 Building stable odds snapshot...")
+    df["EV_Home"] = (df["Prob_Home"] * df["HomeOdds"]) - 1
+    df["source"] = sheet
+    df["fetched_at"] = datetime.utcnow()
 
-    hist = pd.read_csv(HISTORY_CSV, parse_dates=["snapshot_time"])
-    cutoff = hist["snapshot_time"].max() - timedelta(hours=HOURS_BACK)
-    hist = hist[hist["snapshot_time"] >= cutoff]
+    dfs.append(df)
+    print(sheet, len(df))
 
-    rows = []
+# GABUNG KE BAWAH
+final_df = pd.concat(dfs, ignore_index=True)
 
-    for (home, away), g in hist.groupby(["HomeTeam", "AwayTeam"]):
-        if len(g) < MIN_SNAPSHOTS:
-            continue
+# SIMPAN CSV
+final_df.to_csv(OUTPUT_CSV, index=False)
+print(f"✅ CSV saved: {OUTPUT_CSV} ({len(final_df)} rows)")
 
-        odds_std = g["HomeOdds"].std()
-
-        if odds_std > MAX_ODDS_STD:
-            continue
-
-        rows.append({
-            "HomeTeam": home,
-            "AwayTeam": away,
-            "HomeForm": g["HomeForm"].iloc[-1],
-            "AwayForm": g["AwayForm"].iloc[-1],
-            "HomeOdds": g["HomeOdds"].median(),
-            "DrawOdds": g["DrawOdds"].median(),
-            "AwayOdds": g["AwayOdds"].median(),
-            "SnapshotCount": len(g),
-            "OddsStd": odds_std
-        })
-
-    snap = pd.DataFrame(rows)
-    if snap.empty:
-        print("⚠️ No stable matches yet — need more snapshots.")
-        snap.to_csv(SNAPSHOT_CSV, index=False)
-        print("Waiting 1 hour...")
-        time.sleep(3600)
-    snap.to_csv(SNAPSHOT_CSV, index=False)
-
-    print(f"✔ Stable matches: {len(snap)}")
-
-    # ======================
-    # STEP 3 — PREDICTION
-    # ======================
-    print("🤖 Running prediction model...")
-
-    def decide(row):
-        h, a = row.HomeForm, row.AwayForm
-        ho, do, ao = row.HomeOdds, row.DrawOdds, row.AwayOdds
-
-        formdiff = h - a
-
-        imp = np.array([1/ho, 1/do, 1/ao])
-        imp /= imp.sum()
-
-        X = np.array([[formdiff, imp[0], imp[1], imp[2], 1]])
-        X = IMP.transform(X)
-
-        probs = CALIB.predict_proba(X)[0]
-        classes = CALIB.classes_
-
-        p = dict(zip(classes, probs))
-        p_home = p["HomeWin"]
-
-        ev_home = p_home * ho - 1
-
-        decision = (
-            p_home >= 0.90 and
-            ev_home >= CFG["EV_THRESH"]
-        )
-
-        return pd.Series({
-            "Prob_Home": p_home,
-            "EV_Home": ev_home,
-            "Decision": "BET" if decision else "NO_BET"
-        })
-
-    pred = snap.join(snap.apply(decide, axis=1))
-    pred["OddsSource"] = f"MEDIAN_{HOURS_BACK}H"
-
-    pred.to_csv(OUTPUT_CSV, index=False)
-    bets = pred[pred["Decision"] == "BET"]
-
-    print("✅ DONE")
-    print(pred[[
-        "HomeTeam", "AwayTeam",
-        "Prob_Home", "EV_Home",
-        "SnapshotCount", "OddsStd",
-        "Decision"
-    ]].sort_values("Prob_Home", ascending=False).head(10))
-
-    if not bets.empty:
-        send_telegram(bets)
-    else:
-        print("ℹ️ No BET signals to send")
+# KIRIM TELEGRAM (ANTI DUPLIKASI)
+send_telegram(final_df)
